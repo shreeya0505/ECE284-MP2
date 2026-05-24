@@ -24,7 +24,7 @@ SPEC_DIR="${HOME}/Downloads/Project1_SPEC-master"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHANGE_BP_SCRIPT="${SCRIPT_DIR}/change_branch_predictor.sh"
 RESULTS_DIR="${SCRIPT_DIR}/results"
-XLSX_FILE="${RESULTS_DIR}/result.xlsx"
+CSV_FILE="${RESULTS_DIR}/result.csv"
 
 # Branch predictors to sweep (Project 2 requires all three)
 BRANCH_PREDICTORS=("LocalBP" "BiModeBP" "TournamentBP")
@@ -163,27 +163,10 @@ for BP in "${BRANCH_PREDICTORS[@]}"; do
         BM_OUT_DIR="${BP_RESULT_DIR}/${BM}/m5out"
         STATS_FILE="${BM_OUT_DIR}/stats.txt"
 
-        # ── ③ Skip check: does this row already exist in result.xlsx? ────────
-        if [[ -f "${XLSX_FILE}" && -f "${STATS_FILE}" ]]; then
-            ALREADY=$(python3 - "${XLSX_FILE}" "${BP}" "${BM}" <<'PYEOF'
-import sys
-try:
-    import openpyxl
-    wb = openpyxl.load_workbook(sys.argv[1])
-    ws = wb.active
-    bp, bm = sys.argv[2], sys.argv[3]
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if row[0] == bp and row[1] == bm:
-            print("yes"); sys.exit(0)
-    print("no")
-except Exception:
-    print("no")
-PYEOF
-)
-            if [[ "${ALREADY}" == "yes" ]]; then
-                warn "  Skipping ${BP} × ${BM} — already in result.xlsx."
-                continue
-            fi
+        # ── ③ Skip check: does this row already exist in result.csv? ────────
+        if [[ -f "${CSV_FILE}" ]] && grep -q "^${BP},${BM}," "${CSV_FILE}"; then
+            warn "  Skipping ${BP} × ${BM} — already in result.csv."
+            continue
         fi
 
         # ── ④ Run simulation ─────────────────────────────────────────────────
@@ -242,123 +225,44 @@ PYEOF
         # ── ⑥ Collect stats ──────────────────────────────────────────────────
         info "  Collecting stats from ${STATS_FILE} ..."
 
-        IL1_MISS=$(extract_stat "${STATS_FILE}" "system.cpu.icache.overall_misses::total")
-        DL1_MISS=$(extract_stat "${STATS_FILE}" "system.cpu.dcache.overall_misses::total")
-        L2_MISS=$(extract_stat  "${STATS_FILE}" "system.l2.overall_misses::total")
-        TOTAL_INST=$(extract_stat "${STATS_FILE}" "simInsts")
+        IL1_MISS=$(extract_stat "${STATS_FILE}" "system.cpu.icache.overallMisses::total")
+        DL1_MISS=$(extract_stat "${STATS_FILE}" "system.cpu.dcache.overallMisses::total")
+        L2_MISS=$(extract_stat  "${STATS_FILE}" "system.l2.overallMisses::total")
+        TOTAL_INST=$(extract_stat "${STATS_FILE}" "sim_insts")
         BTB_MISS_PCT=$(extract_stat "${STATS_FILE}" "BTBMissPct")
         BRANCH_MISPRED_PCT=$(extract_stat "${STATS_FILE}" "BranchMispredPercent")
 
-        # Fallback stat names (gem5 versions differ slightly)
-        [[ "${IL1_MISS}" == "0" ]] && \
-            IL1_MISS=$(extract_stat "${STATS_FILE}" "system.cpu.icache.overall_miss_num::total")
-        [[ "${DL1_MISS}" == "0" ]] && \
-            DL1_MISS=$(extract_stat "${STATS_FILE}" "system.cpu.dcache.overall_miss_num::total")
-        [[ "${L2_MISS}"  == "0" ]] && \
-            L2_MISS=$(extract_stat  "${STATS_FILE}" "system.l2.overall_miss_num::total")
+        # Fallback stat names (try alternate conventions if primary returned 0)
+        [[ "${IL1_MISS}"   == "0" ]] && \
+            IL1_MISS=$(extract_stat "${STATS_FILE}" "system.cpu.icache.overall_misses::total")
+        [[ "${DL1_MISS}"   == "0" ]] && \
+            DL1_MISS=$(extract_stat "${STATS_FILE}" "system.cpu.dcache.overall_misses::total")
+        [[ "${L2_MISS}"    == "0" ]] && \
+            L2_MISS=$(extract_stat  "${STATS_FILE}" "system.l2.overall_misses::total")
+        [[ "${TOTAL_INST}" == "0" ]] && \
+            TOTAL_INST=$(extract_stat "${STATS_FILE}" "simInsts")
 
-        # ── ⑦ Append to result.xlsx via Python ───────────────────────────────
-        python3 - \
-            "${XLSX_FILE}" "${BP}" "${BM}" \
-            "${IL1_MISS}" "${DL1_MISS}" "${L2_MISS}" "${TOTAL_INST}" \
-            "${BTB_MISS_PCT}" "${BRANCH_MISPRED_PCT}" \
-            "${L1_MISS_PENALTY}" "${L2_MISS_PENALTY}" \
-            <<'PYEOF'
-import sys, os
-from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
+        # ── ⑦ Compute CPI and append to result.csv ───────────────────────────
+        # CPI = 1 + [(IL1_miss + DL1_miss)*10 + L2_miss*80] / Total_Inst
+        CPI=$(awk "BEGIN {
+            il1=${IL1_MISS}; dl1=${DL1_MISS}; l2=${L2_MISS}; inst=${TOTAL_INST}
+            if (inst > 0)
+                printf \"%.6f\", 1 + ((il1+dl1)*${L1_MISS_PENALTY} + l2*${L2_MISS_PENALTY}) / inst
+            else
+                print \"N/A\"
+        }")
 
-xlsx        = sys.argv[1]
-bp          = sys.argv[2]
-bm          = sys.argv[3]
-il1_miss    = sys.argv[4]
-dl1_miss    = sys.argv[5]
-l2_miss     = sys.argv[6]
-total_inst  = sys.argv[7]
-btb_miss    = sys.argv[8]
-branch_mis  = sys.argv[9]
-l1_pen      = sys.argv[10]
-l2_pen      = sys.argv[11]
+        # Write CSV header if file does not exist yet
+        if [[ ! -f "${CSV_FILE}" ]]; then
+            echo "BranchPredictor,Benchmark,IL1_Misses,DL1_Misses,L2_Misses,Total_Instructions,BTBMissPct,BranchMispredPercent,CPI" \
+                > "${CSV_FILE}"
+        fi
 
-HEADERS = [
-    "BranchPredictor", "Benchmark",
-    "IL1_Misses", "DL1_Misses", "L2_Misses", "Total_Instructions",
-    "BTBMissPct", "BranchMispredPercent",
-    "CPI"
-]
+        # Append result row
+        echo "${BP},${BM},${IL1_MISS},${DL1_MISS},${L2_MISS},${TOTAL_INST},${BTB_MISS_PCT},${BRANCH_MISPRED_PCT},${CPI}" \
+            >> "${CSV_FILE}"
 
-# CPI = 1 + [(IL1+DL1)*L1_pen + L2*L2_pen] / Total_Inst
-# Written as Excel formula so the sheet stays dynamic
-def cpi_formula(row):
-    # Columns: C=IL1, D=DL1, E=L2, F=Total_Inst
-    return (
-        f"=1+((C{row}+D{row})*{l1_pen}+E{row}*{l2_pen})/F{row}"
-    )
-
-# ── Load or create workbook ───────────────────────────────────────────────
-if os.path.exists(xlsx):
-    wb = load_workbook(xlsx)
-    ws = wb.active
-    # Ensure headers present (in case file was created externally)
-    if ws.max_row == 0 or ws.cell(1, 1).value != "BranchPredictor":
-        ws.insert_rows(1)
-        for col, h in enumerate(HEADERS, 1):
-            ws.cell(1, col).value = h
-else:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Results"
-
-# ── Write headers if sheet is empty ──────────────────────────────────────
-if ws.max_row < 1 or ws.cell(1, 1).value is None:
-    for col, h in enumerate(HEADERS, 1):
-        c = ws.cell(1, col, h)
-        c.font      = Font(bold=True, color="FFFFFF", name="Arial", size=11)
-        c.fill      = PatternFill("solid", start_color="2E4057")
-        c.alignment = Alignment(horizontal="center", wrap_text=True)
-
-# ── Append data row ───────────────────────────────────────────────────────
-next_row = ws.max_row + 1
-
-# Alternate row shading
-fill_color = "EBF1F5" if next_row % 2 == 0 else "FFFFFF"
-row_fill   = PatternFill("solid", start_color=fill_color)
-
-thin = Side(border_style="thin", color="CCCCCC")
-border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-values = [
-    bp, bm,
-    int(float(il1_miss)), int(float(dl1_miss)), int(float(l2_miss)),
-    int(float(total_inst)),
-    float(btb_miss), float(branch_mis),
-    cpi_formula(next_row)
-]
-
-for col, val in enumerate(values, 1):
-    c = ws.cell(next_row, col, val)
-    c.fill   = row_fill
-    c.border = border
-    c.font   = Font(name="Arial", size=10)
-    if col in (3, 4, 5, 6):
-        c.number_format = "#,##0"
-    elif col in (7, 8):
-        c.number_format = "0.000000"
-    elif col == 9:
-        c.number_format = "0.0000"
-    c.alignment = Alignment(horizontal="center")
-
-# ── Column widths ─────────────────────────────────────────────────────────
-widths = [16, 14, 14, 14, 12, 20, 16, 22, 10]
-for i, w in enumerate(widths, 1):
-    ws.column_dimensions[get_column_letter(i)].width = w
-
-wb.save(xlsx)
-print(f"Appended: {bp} x {bm}  →  {xlsx}")
-PYEOF
-
-        success "  Saved to result.xlsx: ${BP} × ${BM}"
+        success "  Saved to result.csv: ${BP} × ${BM}"
         echo ""
         info "  Stats summary:"
         echo "    IL1_Misses           = ${IL1_MISS}"
@@ -367,6 +271,7 @@ PYEOF
         echo "    Total_Instructions   = ${TOTAL_INST}"
         echo "    BTBMissPct           = ${BTB_MISS_PCT}"
         echo "    BranchMispredPercent = ${BRANCH_MISPRED_PCT}"
+        echo "    CPI                  = ${CPI}"
 
     done  # benchmark loop
 
@@ -381,14 +286,13 @@ echo "  Sweep Complete"
 echo "============================================================${RESET}"
 echo ""
 info "Results directory : ${RESULTS_DIR}"
-info "XLSX output       : ${XLSX_FILE}"
+info "CSV output        : ${CSV_FILE}"
 echo ""
-if [[ -f "${XLSX_FILE}" ]]; then
-    ROW_COUNT=$(python3 -c "
-import openpyxl
-wb = openpyxl.load_workbook('${XLSX_FILE}')
-print(wb.active.max_row - 1)
-" 2>/dev/null || echo "?")
-    success "result.xlsx contains ${ROW_COUNT} result row(s)."
+if [[ -f "${CSV_FILE}" ]]; then
+    ROW_COUNT=$(( $(wc -l < "${CSV_FILE}") - 1 ))
+    success "result.csv contains ${ROW_COUNT} result row(s)."
+    echo ""
+    column -t -s',' "${CSV_FILE}" | sed 's/^/  /'
 fi
+echo ""
 success "All done."
